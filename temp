@@ -1,0 +1,685 @@
+our architecture is already a good foundation for production, especially because you're separating semantic retrieval (Qdrant) from structural retrieval (Neo4j). The biggest opportunity is to avoid making every query go through expensive multi-query + graph + reranking, because that increases latency and tokens without necessarily improving results.
+
+I would evolve it toward a hybrid, adaptive retrieval architecture.
+
+1. Recommended production architecture
+                         ┌─────────────────────┐
+                         │      User Query     │
+                         └──────────┬──────────┘
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │ Query Understanding │
+                         │ intent + entities   │
+                         └──────────┬──────────┘
+                                    │
+                    ┌───────────────┼────────────────┐
+                    │               │                │
+                    ▼               ▼                ▼
+              Vector Search    Graph Search     Exact Search
+                 Qdrant           Neo4j          Symbol/DB
+                    │               │                │
+                    └───────────────┼────────────────┘
+                                    ▼
+                         ┌─────────────────────┐
+                         │ Context Fusion      │
+                         │ dedupe + filtering  │
+                         └──────────┬──────────┘
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │      Reranker       │
+                         │ top 50 → top 8/12   │
+                         └──────────┬──────────┘
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │ Context Compressor  │
+                         │ remove redundancy   │
+                         └──────────┬──────────┘
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │        LLM          │
+                         └─────────────────────┘
+
+The important change is:
+
+Don't always execute every retrieval strategy. Make retrieval adaptive.
+
+2. Your ingestion architecture
+
+Your current:
+
+Repository
+   ↓
+Read files
+   ↓
+Parse Java
+   ↓
+Chunk
+   ↓
+Qdrant
+   ↓
+Neo4j
+   ↓
+commit hash
+
+is correct conceptually.
+
+I'd make it:
+
+Git Repository
+      │
+      ▼
+Change Detector
+      │
+      ├── unchanged → skip
+      │
+      └── changed
+            │
+            ▼
+       Java Parser
+            │
+            ▼
+       AST / Symbol Model
+            │
+       ┌────┴─────┐
+       ▼          ▼
+   Chunker      Graph Builder
+       │          │
+       ▼          ▼
+    Qdrant      Neo4j
+       │          │
+       └────┬─────┘
+            ▼
+       Index Manifest
+Add an index manifest
+
+Don't only store commit hash.
+
+Store something like:
+
+{
+  "repository": "axis-oms",
+  "branch": "aws/prod",
+  "commit": "e7ad73...",
+  "filePath": ".../FinancialOrderCheckoutServiceImpl.java",
+  "fileHash": "...",
+  "parserVersion": "1.4",
+  "chunkerVersion": "2.1",
+  "embeddingModel": "nomic-embed-text",
+  "embeddingVersion": "1",
+  "indexedAt": "..."
+}
+
+This becomes very useful when you change:
+
+chunking strategy
+embedding model
+parser
+metadata
+graph schema
+
+You can then selectively re-index instead of rebuilding everything.
+
+3. Don't make RAPTOR your default
+
+This is one of the biggest recommendations I'd make.
+
+For a code RAG system, RAPTOR is not necessarily the first upgrade I'd implement.
+
+RAPTOR is more useful when documents have hierarchical semantic structure:
+
+Document
+  ↓
+Sections
+  ↓
+Subsections
+  ↓
+Summaries
+
+Code already has a much better natural hierarchy:
+
+Repository
+  ↓
+Module
+  ↓
+Package
+  ↓
+Class
+  ↓
+Method
+  ↓
+Statements
+
+You already have this hierarchy in Neo4j.
+
+So instead of creating another expensive hierarchical summary layer, exploit your semantic graph.
+
+For example:
+
+processOrder()
+       │
+       ├── DECLARED_IN → FinancialOrderCheckoutServiceImpl
+       │
+       ├── CALLS → validateRequest()
+       │
+       ├── CALLS → calculateInterest()
+       │
+       ├── CALLS → saveOrder()
+       │
+       └── USES → OrderRepository
+
+This is more useful for code understanding than generic RAPTOR summaries.
+
+4. Multi-Query Generation: yes, but make it conditional
+
+Your current:
+
+Question
+   ↓
+Generate 5 variations
+   ↓
+Qdrant × 5
+
+works, but it is expensive.
+
+Don't always generate 5 queries.
+
+Instead:
+
+User Query
+    ↓
+Query Classifier
+    │
+    ├── Exact symbol → 1 query
+    │
+    ├── Dependency → Neo4j
+    │
+    ├── Conceptual → 2-3 vector queries
+    │
+    └── Complex → Multi-query
+
+For example:
+
+User
+
+Where is processOrder implemented?
+
+Don't do multi-query.
+
+Do:
+
+findSymbol("processOrder")
+
+Then Neo4j.
+
+User
+
+How is FD checkout validated before processing?
+
+Now multi-query is useful:
+
+FD checkout validation
+validation before processOrder
+checkout request validation flow
+
+Maybe 2–3 queries rather than 5.
+
+User
+
+Explain why processOrder can fail when interest calculation fails.
+
+Now use:
+
+Vector
++
+Graph
++
+Call relationships
+5. Add query intent classification
+
+This is probably the highest-value upgrade for your architecture.
+
+Before retrieval, classify:
+
+EXACT_SYMBOL
+FILE_LOOKUP
+CONCEPTUAL
+DEPENDENCY
+CALL_GRAPH
+IMPACT_ANALYSIS
+CONFIGURATION
+BUSINESS_LOGIC
+DEBUGGING
+ARCHITECTURE
+
+Then route accordingly.
+
+Example
+"Where is processOrder?"
+        ↓
+EXACT_SYMBOL
+        ↓
+Neo4j
+"What calls processOrder?"
+        ↓
+CALL_GRAPH
+        ↓
+Neo4j
+"How is FD interest calculated?"
+        ↓
+CONCEPTUAL
+        ↓
+Qdrant
+"What happens when processOrder fails?"
+        ↓
+BUSINESS_LOGIC
+        ↓
+Qdrant + Neo4j
+
+This avoids unnecessary retrieval.
+
+6. Your "fallback DB search" should be more explicit
+
+You currently have:
+
+Qdrant + Neo4j
+       ↓
+if nothing
+       ↓
+DB
+
+I would change this to:
+
+Exact search
+    ↓
+Graph search
+    ↓
+Vector search
+    ↓
+Fusion
+    ↓
+Confidence evaluation
+    ↓
+if confidence < threshold
+    ↓
+Expanded retrieval
+
+Don't use simply:
+
+if results == 0
+
+because you can have:
+
+Qdrant → 10 results
+Neo4j → 5 results
+
+and still have poor results.
+
+You need a retrieval confidence score.
+
+7. Add retrieval confidence
+
+For example:
+
+Vector score
+Graph relevance
+Symbol exactness
+Repository match
+Module match
+Branch/commit match
+
+Build:
+
+retrieval_score =
+    0.40 * vector_score
+  + 0.25 * graph_score
+  + 0.20 * symbol_match
+  + 0.10 * repository_match
+  + 0.05 * freshness
+
+Then:
+
+score >= 0.80
+    → answer
+
+
+0.60–0.80
+    → rerank / expand
+
+
+< 0.60
+    → deeper retrieval
+
+This is much better than:
+
+if Qdrant empty
+8. Your reranker should receive fewer candidates
+
+Don't do:
+
+5 queries
+ ×
+Qdrant top 20
+ =
+100 chunks
+
+and then dump them into reranking.
+
+Instead:
+
+Qdrant
+  3 queries × top 10
+       ↓
+     30
+
+
+Neo4j
+       ↓
+     10-20
+
+
+dedupe
+       ↓
+     30-40
+
+
+reranker
+       ↓
+     top 8-12
+
+Then only those 8–12 chunks go to the LLM.
+
+This directly reduces token consumption.
+
+9. Add parent/child chunking
+
+For code, I strongly recommend this.
+
+Instead of only:
+
+chunk → embedding
+
+store:
+
+Method
+ ├── method metadata
+ ├── method summary
+ ├── method signature
+ └── code chunks
+
+For example:
+
+Method:
+processOrder(ProcessOrderRequest)
+
+
+Chunk 1:
+lines 158-175
+
+
+Chunk 2:
+lines 176-190
+
+
+Chunk 3:
+lines 191-199
+
+Qdrant retrieves the relevant chunk.
+
+Then use Neo4j to retrieve the parent method/class context.
+
+This avoids putting entire Java classes into the LLM context.
+
+10. Add code-specific embeddings
+
+Your current:
+
+Ollama
+└── nomic-embed-text
+
+is fine for a POC, but I would benchmark a code-oriented embedding model against it before productionizing.
+
+Don't change it blindly.
+
+Create an evaluation dataset:
+
+100 real developer questions
+        ↓
+expected files/methods
+        ↓
+compare embedding models
+        ↓
+Recall@5
+Recall@10
+MRR
+NDCG
+
+Choose the model based on your codebase, not generic embedding benchmarks.
+
+11. Don't send raw graph data to the LLM
+
+This is important.
+
+Avoid:
+
+{
+  "node": {...},
+  "relationships": [...],
+  "properties": [...]
+}
+
+Instead convert graph results into compact evidence:
+
+processOrder()
+  class: FinancialOrderCheckoutServiceImpl
+  file: FinancialOrderCheckoutServiceImpl.java:158-199
+
+
+Calls:
+  validateRequest()
+  calculateInterest()
+  saveOrder()
+
+
+Called by:
+  checkout()
+  retryOrder()
+
+That is dramatically more token-efficient.
+
+12. Introduce a Context Builder
+
+I'd add a dedicated component:
+
+              Qdrant
+                 │
+                 ▼
+             candidates
+                 │
+Neo4j ───────────┤
+                 ▼
+          Context Builder
+                 │
+        ┌────────┼─────────┐
+        │        │         │
+      dedupe   compress   rank
+        │        │         │
+        └────────┼─────────┘
+                 ▼
+            LLM Context
+
+The Context Builder should:
+
+deduplicate chunks
+remove duplicate symbols
+merge adjacent code chunks
+remove irrelevant properties
+remove duplicate graph relationships
+enforce token budget
+preserve file/line references
+13. Token budget should be explicit
+
+Don't let retrieval determine context size.
+
+Define:
+
+LLM context budget
+       ↓
+e.g. 12,000 tokens
+
+Then allocate:
+
+System instructions     2,000
+User question             500
+Graph context           2,000
+Code context            6,000
+Metadata                  500
+Reserve                 1,000
+
+The Context Builder must stop when the budget is reached.
+
+14. Cache aggressively
+
+You should have at least three caches.
+
+Query cache
+question hash
+      ↓
+retrieval result
+Embedding cache
+chunk hash
+      ↓
+embedding
+
+You already have file hashing; extend this to chunk-level hashing.
+
+Graph query cache
+
+For common queries:
+
+findSymbol
+findCallers
+findCallees
+findDependencies
+
+cache short-lived results.
+
+15. Your MCP layer should remain high-level
+
+Based on your previous MCP design, I would not expose raw Qdrant and Neo4j operations directly to the LLM.
+
+Instead expose tools like:
+
+findSymbol
+searchCode
+findCallers
+findCallees
+findDependencies
+findImpact
+searchRepository
+
+Good:
+
+findSymbol(
+    name="processOrder",
+    repository="axis-oms"
+)
+
+Bad:
+
+executeCypher(
+    query="MATCH (n)..."
+)
+
+The agent shouldn't need to know your graph schema.
+
+16. Recommended final architecture
+
+I would target this:
+
+                         USER
+                           │
+                           ▼
+                 ┌──────────────────┐
+                 │ Query Understanding│
+                 │ intent + entities │
+                 └─────────┬────────┘
+                           │
+                           ▼
+                 ┌──────────────────┐
+                 │ Retrieval Router │
+                 └─────────┬────────┘
+                           │
+             ┌─────────────┼─────────────┐
+             │             │             │
+             ▼             ▼             ▼
+         Exact/MCP      Qdrant        Neo4j
+             │             │             │
+             │       1-3 queries     dependency
+             │             │           traversal
+             └─────────────┼─────────────┘
+                           ▼
+                 ┌──────────────────┐
+                 │ Candidate Fusion │
+                 │ dedupe/filter    │
+                 └─────────┬────────┘
+                           ▼
+                 ┌──────────────────┐
+                 │ Confidence Check │
+                 └───────┬───┬──────┘
+                         │   │
+                    high │   │ low
+                         │   ▼
+                         │ Multi-query/
+                         │ graph expansion
+                         │
+                         ▼
+                 ┌──────────────────┐
+                 │     Reranker     │
+                 │ 30-50 → 8-12     │
+                 └─────────┬────────┘
+                           ▼
+                 ┌──────────────────┐
+                 │ Context Builder  │
+                 │ compression      │
+                 │ token budget     │
+                 └─────────┬────────┘
+                           ▼
+                         LLM
+Priority of upgrades
+
+I wouldn't implement everything simultaneously.
+
+🔴 Priority 1 — highest impact
+Query intent/router
+Adaptive retrieval
+Retrieval confidence score
+Context builder + strict token budget
+Deduplication
+Reduce multi-query from fixed 5 → dynamic 1–3
+🟠 Priority 2
+Better code chunking: method/class/statement hierarchy
+Parent-child retrieval
+Graph-aware context expansion
+Query/embedding/result caching
+Retry + controlled concurrency for ingestion
+🟡 Priority 3
+Evaluate code-specific embedding models
+Hybrid lexical + vector retrieval
+Query expansion
+Context compression
+🟢 Experimental
+RAPTOR
+Agentic retrieval
+Self-reflective retrieval
+
+I would not make RAPTOR the next upgrade. Your Neo4j semantic graph already gives you a structural hierarchy that is much more valuable for a Java codebase.
+
+The biggest optimization for your architecture is:
+
+Use Neo4j to understand code structure, Qdrant to understand code meaning, and an adaptive router to decide which one is needed. Don't use both for every question.
+
+That will give you lower latency + fewer embedding/model calls + fewer reranker candidates + substantially fewer LLM tokens, while generally improving code-retrieval precision.

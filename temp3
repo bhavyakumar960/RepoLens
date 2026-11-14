@@ -1,0 +1,2613 @@
+# RAG / Code Intelligence Pipeline Improvement — Implementation Prompt
+
+## Objective
+
+Review and improve the existing code-intelligence RAG pipeline.
+
+The current system already contains:
+
+* Java AST-based ingestion
+* Neo4j code graph
+* Qdrant vector store
+* Ollama `nomic-embed-text` embeddings
+* Spring AI vector retrieval
+* Intent classification
+* Adaptive retrieval routing
+* Cross-encoder reranking through TEI
+* Source-code line retrieval
+* Context building
+* Neo4j dependency/call-graph traversal
+* Cross-repository relationship resolution
+* Incremental ingestion
+* Ingestion-state tracking
+
+Do NOT replace the existing architecture.
+
+The goal is to evolve it into a **code-aware Graph + Vector + Lexical Hybrid RAG system** with better retrieval accuracy, better context selection, better cross-repository reasoning, and measurable retrieval quality.
+
+Before modifying code:
+
+1. Inspect the existing project structure.
+2. Identify the current ingestion pipeline.
+3. Identify the AST parser and symbol model.
+4. Identify the Neo4j graph-writing services.
+5. Identify Qdrant/vector indexing and retrieval services.
+6. Identify the query intent classifier.
+7. Identify the adaptive retrieval router.
+8. Identify the reranking implementation.
+9. Identify the ranking/confidence services.
+10. Identify context-building and source-code retrieval.
+11. Identify cross-repository linking and reconciliation.
+12. Identify existing caching.
+13. Identify existing tests.
+14. Reuse existing abstractions wherever possible.
+15. Do not duplicate functionality that already exists.
+
+Implement the improvements incrementally and preserve backward compatibility.
+
+---
+
+# 1. Create a Unified Retrieval Pipeline
+
+Refactor the retrieval architecture into explicit stages:
+
+```text
+User Query
+    |
+    v
+Query Understanding
+    |
+    +--> Intent
+    +--> Symbols
+    +--> Repository
+    +--> Class
+    +--> Method
+    +--> File
+    +--> Business Terms
+    +--> Constraints
+    |
+    v
+Query Planner
+    |
+    +------------------+
+    |                  |
+    v                  v
+Lexical Search      Vector Search
+    |                  |
+    +--------+---------+
+             |
+             v
+       Initial Candidates
+             |
+             v
+       Graph Expansion
+             |
+             v
+      Parent/Neighbor Expansion
+             |
+             v
+        Candidate Fusion
+             |
+             v
+       Cross Encoder
+          Reranking
+             |
+             v
+      Evidence Graph
+             |
+             v
+     Confidence Filtering
+             |
+             v
+     Exact Source Retrieval
+             |
+             v
+      Context Compression
+             |
+             v
+             LLM
+```
+
+Create clear interfaces/components for these stages rather than putting all logic into one retrieval service.
+
+Suggested abstractions:
+
+```java
+QueryUnderstandingService
+QueryPlanner
+LexicalCodeRetriever
+VectorCodeRetriever
+GraphExpansionService
+ContextExpansionService
+CandidateFusionService
+CodeRankingService
+EvidenceGraphBuilder
+RetrievalConfidenceService
+SourceCodeContextService
+ContextBuilder
+```
+
+Reuse existing implementations where they already provide the required functionality.
+
+---
+
+# 2. Add Query Entity Extraction
+
+The current intent classification determines the retrieval strategy, but also extract concrete entities from the query.
+
+Extract:
+
+* repository
+* module
+* package
+* class
+* method
+* field
+* file
+* API endpoint
+* HTTP method
+* annotation
+* business term
+* database/entity name
+* service name
+
+Example:
+
+```text
+"What calls processOrder in the FD checkout service?"
+```
+
+Extract:
+
+```text
+symbol = processOrder
+domain = FD
+concept = checkout
+relationship = CALLER
+```
+
+Do not rely only on LLM-based extraction.
+
+Use deterministic symbol matching against Neo4j first where possible.
+
+For example:
+
+```text
+processOrder
+ProcessOrderRequest
+FinancialOrderCheckoutServiceImpl
+```
+
+should be resolved against the graph before semantic retrieval.
+
+---
+
+# 3. Improve Query Intent Classification
+
+Preserve the existing intents:
+
+```text
+EXACT_SYMBOL
+FILE_LOOKUP
+CONCEPTUAL
+DEPENDENCY
+CALL_GRAPH
+IMPACT_ANALYSIS
+CONFIGURATION
+BUSINESS_LOGIC
+DEBUGGING
+ARCHITECTURE
+UNKNOWN
+```
+
+Add specialized intents where useful:
+
+```text
+FLOW_TRACE
+CHANGE_ANALYSIS
+ERROR_TRACE
+API_FLOW
+DATABASE_FLOW
+CROSS_REPO_FLOW
+TEST_IMPACT
+```
+
+Each intent must define:
+
+```text
+retrieval sources
+query expansion strategy
+graph depth
+vector topK
+lexical topK
+reranking requirement
+context expansion requirement
+```
+
+Example:
+
+```text
+CALL_GRAPH
+
+Neo4j:
+    required
+
+Vector:
+    optional
+
+Lexical:
+    optional
+
+Graph depth:
+    1-2
+
+Reranking:
+    disabled unless textual candidates are involved
+```
+
+---
+
+# 4. Add Lexical / BM25 Retrieval
+
+Do not rely entirely on embeddings for code search.
+
+Code queries frequently contain exact identifiers:
+
+```text
+processOrder
+validateOtpV2
+CustomerDropOff
+utmParam
+business-loan-orchestrator
+FinancialOrderCheckoutServiceImpl
+```
+
+These should be handled extremely well by lexical search.
+
+Introduce a lexical retrieval layer.
+
+Preferred implementation:
+
+* OpenSearch/Elasticsearch if already available
+* otherwise a lightweight local BM25 implementation
+* alternatively use an existing searchable index if the project already has one
+
+Index:
+
+```text
+repository
+module
+package
+file
+class
+method
+field
+signature
+annotations
+source code
+comments
+```
+
+Support:
+
+```text
+exact symbol match
+prefix match
+token match
+case-insensitive match
+camelCase tokenization
+snake_case tokenization
+qualified-name matching
+```
+
+For example:
+
+```text
+processOrder
+```
+
+should tokenize/match:
+
+```text
+process
+order
+processOrder
+FinancialOrderCheckoutServiceImpl.processOrder
+```
+
+---
+
+# 5. Implement Hybrid Retrieval
+
+Use:
+
+```text
+Lexical + Vector + Graph
+```
+
+rather than:
+
+```text
+Vector + Graph only
+```
+
+Initial retrieval should run lexical and vector searches in parallel when appropriate.
+
+Example:
+
+```text
+Query
+  |
+  +--> BM25
+  |
+  +--> Qdrant
+  |
+  +--> Neo4j exact symbol lookup
+```
+
+Merge all candidates.
+
+Do not simply concatenate results.
+
+Use a ranking/fusion mechanism.
+
+Initially implement Reciprocal Rank Fusion (RRF):
+
+```text
+RRFScore(d) =
+    Σ 1 / (k + rank_i(d))
+```
+
+where each retrieval strategy contributes independently.
+
+Keep the implementation extensible so weighted fusion can be introduced later.
+
+---
+
+# 6. Add Code-Aware Embedding Representation
+
+Currently embeddings are primarily generated from chunk text.
+
+Improve the embedding representation by prepending structured code metadata.
+
+For a method, create an embedding representation similar to:
+
+```text
+Repository: axis-oms
+Module: checkout
+Package: com.axis.checkout
+Class: FinancialOrderCheckoutServiceImpl
+
+Method:
+processOrder
+
+Signature:
+processOrder(ProcessOrderRequest, String)
+
+Annotations:
+@Transactional
+
+Dependencies:
+CustomerService
+InterestService
+OrderRepository
+
+Calls:
+validateCustomer
+calculateInterest
+saveOrder
+
+Returns:
+ChubResponseBody
+
+Source:
+<method source>
+```
+
+Important:
+
+Do NOT use this representation as the final LLM context.
+
+Maintain two representations:
+
+```text
+embedding_text
+source_text
+```
+
+The embedding text should optimize retrieval.
+
+The source text should optimize code understanding.
+
+Store the structured information in metadata as well.
+
+---
+
+# 7. Add Separate Embedding Representations Where Useful
+
+Do not immediately introduce unnecessary physical vector collections.
+
+First support logical embedding types:
+
+```text
+CODE
+SUMMARY
+SIGNATURE
+```
+
+For example:
+
+```text
+CODE:
+method body
+
+SIGNATURE:
+class + method + parameters + return type
+
+SUMMARY:
+responsibility + dependencies + calls
+```
+
+Initially implement only CODE + SIGNATURE if complexity needs to remain low.
+
+Allow the retrieval layer to select the appropriate representation based on intent.
+
+Example:
+
+```text
+EXACT_SYMBOL
+    -> signature
+
+CONCEPTUAL
+    -> code
+
+ARCHITECTURE
+    -> summary + code
+
+CALL_GRAPH
+    -> Neo4j
+```
+
+---
+
+# 8. Implement Graph-Guided Retrieval
+
+This is one of the most important improvements.
+
+Do not treat Neo4j and Qdrant as completely independent retrieval systems.
+
+Use initial retrieval to identify candidate symbols, then use Neo4j to expand the candidates.
+
+Example:
+
+```text
+Query:
+"How does processOrder validate a customer?"
+```
+
+Initial vector/lexical retrieval:
+
+```text
+processOrder()
+```
+
+Graph expansion:
+
+```text
+processOrder
+    |
+    +-- CALLS --> validateCustomer
+    |
+    +-- CALLS --> validateOrder
+    |
+    +-- CALLS --> calculateInterest
+    |
+    +-- CALLS --> saveOrder
+```
+
+Retrieve source code for the relevant graph neighbors.
+
+Graph relationships to support:
+
+```text
+CALLS
+USES
+INJECTS
+IMPLEMENTS
+EXTENDS
+ACCEPTS
+RETURNS
+TESTED_BY
+```
+
+Also include cross-repository relationships.
+
+---
+
+# 9. Add Configurable Graph Expansion
+
+Create a configurable graph expansion service.
+
+Example:
+
+```properties
+codeintel.graph-expansion.enabled=true
+codeintel.graph-expansion.max-depth=2
+codeintel.graph-expansion.max-results=50
+codeintel.graph-expansion.relationships=CALLS,USES,INJECTS,IMPLEMENTS,EXTENDS
+```
+
+Do not blindly traverse the entire graph.
+
+Apply:
+
+* maximum depth
+* maximum nodes
+* relationship allowlist
+* repository filter
+* module filter
+* confidence threshold
+
+Example:
+
+```text
+Top candidate:
+processOrder
+
+Depth 1:
+validateCustomer
+calculateInterest
+saveOrder
+
+Depth 2:
+CustomerRepository
+InterestService
+OrderRepository
+```
+
+---
+
+# 10. Add Parent / Neighbor Context Expansion
+
+When a vector result identifies a chunk, retrieve its surrounding context.
+
+For example:
+
+```text
+chunk 3
+```
+
+may expand to:
+
+```text
+chunk 2
+chunk 3
+chunk 4
+```
+
+Where possible, prefer AST-aware expansion over arbitrary token windows.
+
+Expansion hierarchy:
+
+```text
+chunk
+  |
+  +--> parent method
+  |
+  +--> class
+  |
+  +--> sibling method
+  |
+  +--> caller
+  |
+  +--> callee
+```
+
+Make expansion configurable.
+
+Example:
+
+```properties
+rag.context-expansion.enabled=true
+rag.context-expansion.neighbor-chunks=1
+rag.context-expansion.include-parent=true
+rag.context-expansion.include-siblings=false
+rag.context-expansion.include-callers=true
+rag.context-expansion.include-callees=true
+```
+
+Do not expand everything automatically.
+
+Use query intent to determine expansion.
+
+---
+
+# 11. Build an Evidence Graph
+
+Introduce an intermediate representation between retrieval and context building.
+
+Each evidence node should contain:
+
+```text
+symbolId
+repository
+module
+package
+filePath
+className
+memberName
+signature
+startLine
+endLine
+
+retrievalSources
+vectorScore
+lexicalScore
+rerankScore
+graphScore
+
+graphDistance
+relationshipToQuery
+confidence
+```
+
+Example:
+
+```text
+processOrder
+    |
+    | CALLS
+    v
+validateCustomer
+    |
+    | CALLS
+    v
+CustomerRepository.findCustomer
+```
+
+Each node should retain its provenance.
+
+This allows the final context builder to understand:
+
+```text
+why was this piece of code retrieved?
+```
+
+Possible retrieval sources:
+
+```text
+VECTOR
+LEXICAL
+GRAPH
+PARENT
+NEIGHBOR
+CALLER
+CALLEE
+DEPENDENCY
+IMPLEMENTATION
+TEST
+```
+
+---
+
+# 12. Improve Candidate Ranking
+
+Create a unified ranking model.
+
+Do not rely solely on cosine similarity.
+
+Candidate score should consider:
+
+```text
+semantic similarity
+lexical relevance
+cross-encoder score
+exact symbol match
+class match
+repository match
+package match
+graph relevance
+graph distance
+relationship type
+query intent
+```
+
+Initially use configurable heuristic weights.
+
+Example:
+
+```text
+finalScore =
+    semanticWeight * semanticScore
+  + lexicalWeight * lexicalScore
+  + rerankWeight * rerankScore
+  + graphWeight * graphScore
+  + symbolWeight * symbolMatch
+  + metadataWeight * metadataMatch
+```
+
+Do not hard-code weights in multiple services.
+
+Centralize them in configuration.
+
+Example:
+
+```properties
+rag.ranking.semantic-weight=0.25
+rag.ranking.lexical-weight=0.20
+rag.ranking.rerank-weight=0.25
+rag.ranking.graph-weight=0.20
+rag.ranking.symbol-weight=0.10
+```
+
+These values are initial defaults only.
+
+---
+
+# 13. Improve Cross-Encoder Reranking
+
+Preserve the current conditional reranking mechanism.
+
+The cross encoder should operate only on a small candidate set.
+
+Recommended flow:
+
+```text
+BM25:
+    top 20
+
+Vector:
+    top 20
+
+Neo4j:
+    top 20
+
+Fusion:
+    ~20-40 unique candidates
+
+Cross encoder:
+    top 20
+
+Final:
+    top 5-15
+```
+
+Do not send hundreds of documents to the cross encoder.
+
+Preserve the existing optimization where exact graph lookups bypass reranking.
+
+---
+
+# 14. Add Graph Relationship Confidence
+
+Every inferred relationship should have provenance and confidence.
+
+Example:
+
+```text
+CALLS
+confidence = 1.0
+resolution = AST_DIRECT
+
+INJECTS
+confidence = 1.0
+resolution = CONSTRUCTOR_INJECTION
+
+CALLS
+confidence = 0.85
+resolution = CROSS_REPO_SIGNATURE_MATCH
+
+USES
+confidence = 0.70
+resolution = TYPE_REFERENCE
+```
+
+Store:
+
+```text
+confidence
+resolutionType
+sourceFile
+sourceLine
+targetFile
+targetLine
+```
+
+on relationships where appropriate.
+
+This allows retrieval to prioritize reliable graph edges.
+
+---
+
+# 15. Improve Cross-Repository Linking
+
+Preserve the current cross-repository linker.
+
+Improve it by ensuring relationships contain:
+
+```text
+sourceRepository
+targetRepository
+sourceModule
+targetModule
+
+sourceClass
+targetClass
+
+sourceMethod
+targetMethod
+
+resolutionType
+confidence
+
+sourceFile
+sourceLine
+targetFile
+targetLine
+```
+
+Support resolution strategies in priority order:
+
+```text
+1. Exact fully-qualified symbol
+2. Imported type
+3. Constructor injection
+4. Interface implementation
+5. Method signature
+6. Parameter/return type
+7. Simple-name fallback
+```
+
+Never treat simple-name matching as equally reliable as exact FQCN matching.
+
+---
+
+# 16. Add Query Decomposition
+
+Complex questions should be broken into subqueries.
+
+Example:
+
+```text
+"Explain how FD checkout processes a request from REST endpoint
+through validation, interest calculation and persistence."
+```
+
+Decompose into:
+
+```text
+1. Find REST endpoint.
+2. Find controller method.
+3. Find service entry point.
+4. Find validation methods.
+5. Find interest calculation.
+6. Find persistence operation.
+7. Find cross-repository calls.
+8. Build execution flow.
+```
+
+Execute independent subqueries in parallel where possible.
+
+Each subquery should have its own retrieval strategy.
+
+---
+
+# 17. Add Flow Tracing
+
+Introduce a dedicated `FLOW_TRACE` retrieval mode.
+
+Example:
+
+```text
+REST endpoint
+    ↓
+Controller
+    ↓
+Service
+    ↓
+Service
+    ↓
+Repository
+    ↓
+Database
+```
+
+Use Neo4j `CALLS`, `USES`, `INJECTS`, and type relationships.
+
+Return:
+
+```text
+source symbol
+target symbol
+relationship
+source line
+target line
+repository
+file
+```
+
+This should be deterministic whenever possible.
+
+Use vector retrieval only to supplement missing semantic details.
+
+---
+
+# 18. Add Change / Impact Analysis
+
+Improve the existing impact analysis.
+
+For:
+
+```text
+"What breaks if I change processOrder?"
+```
+
+retrieve:
+
+```text
+direct callers
+indirect callers
+implementations
+dependencies
+REST endpoints
+cross-repository callers
+tests
+configuration
+```
+
+Classify impact:
+
+```text
+HIGH
+MEDIUM
+LOW
+```
+
+Example:
+
+```text
+HIGH:
+direct caller in production flow
+
+MEDIUM:
+indirect dependency
+
+LOW:
+test-only dependency
+```
+
+Use graph distance and relationship confidence.
+
+---
+
+# 19. Add Test Impact Retrieval
+
+When a method changes:
+
+```text
+method
+  |
+  +--> TESTED_BY
+  |
+  +--> callers
+  |
+  +--> implementations
+```
+
+Find:
+
+```text
+unit tests
+integration tests
+controller tests
+cross-repo tests
+```
+
+Prioritize tests based on directness.
+
+---
+
+# 20. Add Error Trace Retrieval
+
+Introduce `ERROR_TRACE`.
+
+For a question such as:
+
+```text
+"Why can processOrder throw NullPointerException?"
+```
+
+retrieve:
+
+```text
+processOrder
+    |
+    +--> variables
+    +--> method calls
+    +--> null checks
+    +--> exception paths
+    +--> callers
+    +--> configuration
+    +--> tests
+```
+
+Use AST information where possible.
+
+Do not ask the LLM to infer simple structural relationships that Neo4j/AST can determine deterministically.
+
+---
+
+# 21. Implement Hierarchical Retrieval
+
+Support retrieval at:
+
+```text
+Repository
+    ↓
+Module
+    ↓
+Package
+    ↓
+Class
+    ↓
+Method
+    ↓
+Chunk
+```
+
+For architecture queries:
+
+```text
+Query
+ ↓
+Repository candidates
+ ↓
+Module candidates
+ ↓
+Package candidates
+ ↓
+Class candidates
+ ↓
+Methods
+```
+
+For exact symbol queries, skip unnecessary hierarchy.
+
+The query planner should determine the appropriate retrieval level.
+
+---
+
+# 22. Create Repository / Module / Class Summaries
+
+During ingestion, generate compact summaries.
+
+For a class:
+
+```text
+Class:
+FinancialOrderCheckoutService
+
+Responsibility:
+Processes FD checkout requests.
+
+Dependencies:
+CustomerService
+InterestService
+OrderRepository
+
+Important methods:
+processOrder
+validateCustomer
+calculateInterest
+saveOrder
+```
+
+Store summaries as metadata and optionally vectorize them.
+
+Generate summaries only when source/hash changes.
+
+Do not regenerate summaries for unchanged files.
+
+---
+
+# 23. Add Summary Hierarchy
+
+Generate summaries at multiple levels:
+
+```text
+Repository summary
+Module summary
+Package summary
+Class summary
+Method summary
+```
+
+Use them for architecture and conceptual questions.
+
+Example:
+
+```text
+"Explain checkout architecture"
+```
+
+should preferentially retrieve:
+
+```text
+repository summary
+module summary
+class summaries
+```
+
+rather than thousands of method chunks.
+
+---
+
+# 24. Separate Retrieval Context from LLM Context
+
+Do not pass every retrieved candidate directly to the LLM.
+
+Pipeline:
+
+```text
+100 candidates
+    ↓
+40 fused candidates
+    ↓
+20 reranked candidates
+    ↓
+10 evidence nodes
+    ↓
+5-10 source snippets
+    ↓
+compressed context
+    ↓
+LLM
+```
+
+The LLM should receive only high-quality evidence.
+
+---
+
+# 25. Improve Context Compression
+
+Context should be structured.
+
+Recommended format:
+
+```text
+[SYMBOL]
+FinancialOrderCheckoutServiceImpl.processOrder(...)
+
+[FILE]
+...
+
+[LINES]
+120-180
+
+[ROLE]
+Entry point for FD checkout processing.
+
+[CALLS]
+validateCustomer()
+calculateInterest()
+saveOrder()
+
+[DEPENDENCIES]
+CustomerService
+InterestService
+OrderRepository
+
+[SOURCE]
+<exact source>
+```
+
+For graph relationships:
+
+```text
+[SOURCE SYMBOL]
+FinancialOrderCheckoutServiceImpl.processOrder
+
+[RELATIONSHIP]
+CALLS
+
+[TARGET]
+CustomerService.validateCustomer
+
+[SOURCE]
+<source code>
+```
+
+This is more useful than concatenating raw chunks.
+
+---
+
+# 26. Add Metadata-Aware Retrieval
+
+Use Qdrant filters aggressively where the query gives enough information.
+
+Potential filters:
+
+```text
+repository
+branch
+module
+package
+file
+class
+method
+annotation
+memberType
+language
+```
+
+Example:
+
+```text
+"Find processOrder in axis-oms"
+```
+
+should use:
+
+```text
+repository = axis-oms
+```
+
+before vector similarity ranking.
+
+Do not use semantic search when exact metadata filtering can narrow the search.
+
+---
+
+# 27. Improve Similarity Threshold Handling
+
+Do not assume a single global similarity threshold works for every intent.
+
+Current threshold can remain as the fallback.
+
+Add intent-specific thresholds:
+
+```properties
+rag.threshold.exact-symbol=0.50
+rag.threshold.conceptual=0.70
+rag.threshold.architecture=0.65
+rag.threshold.debugging=0.60
+```
+
+However, do not blindly select these values.
+
+Create evaluation tests and tune them against real queries.
+
+---
+
+# 28. Adaptive Top-K
+
+Do not use the same `topK` for every query.
+
+Example:
+
+```text
+EXACT_SYMBOL:
+    vector topK = 5
+
+CONCEPTUAL:
+    vector topK = 20
+
+DEBUGGING:
+    vector topK = 30
+
+ARCHITECTURE:
+    summary topK = 10
+
+CALL_GRAPH:
+    Neo4j only
+```
+
+Make this configuration-driven.
+
+---
+
+# 29. Adaptive Graph Depth
+
+Similarly:
+
+```text
+EXACT_SYMBOL:
+    depth = 0
+
+CALL_GRAPH:
+    depth = 1
+
+DEPENDENCY:
+    depth = 2
+
+IMPACT_ANALYSIS:
+    depth = 3
+
+ARCHITECTURE:
+    package/module traversal
+```
+
+Use hard limits to prevent graph explosion.
+
+---
+
+# 30. Parallelize Independent Retrieval
+
+When a query requires:
+
+```text
+BM25
+Qdrant
+Neo4j
+```
+
+execute them concurrently.
+
+Use asynchronous/non-blocking execution where appropriate.
+
+Example:
+
+```text
+CompletableFuture / virtual threads
+```
+
+depending on the project's existing concurrency model.
+
+Do not increase embedding concurrency blindly.
+
+Respect the current Ollama/Qdrant resource limits.
+
+---
+
+# 31. Add Retrieval Caching
+
+Cache expensive deterministic operations.
+
+Suggested cache layers:
+
+```text
+query → intent
+
+query → extracted entities
+
+query → vector candidates
+
+query → lexical candidates
+
+symbol → graph neighborhood
+
+symbol → source code
+
+query → final evidence graph
+```
+
+Use existing Redis infrastructure if already available.
+
+Every cache should have:
+
+```text
+TTL
+maximum size
+cache key normalization
+invalidation strategy
+```
+
+Do not cache mutable source indefinitely.
+
+---
+
+# 32. Add Query Normalization
+
+Normalize queries before retrieval.
+
+Handle:
+
+```text
+camelCase
+snake_case
+PascalCase
+fully-qualified names
+file names
+method signatures
+Java types
+repository names
+```
+
+Example:
+
+```text
+FinancialOrderCheckoutServiceImpl.processOrder()
+```
+
+should generate search forms:
+
+```text
+FinancialOrderCheckoutServiceImpl
+processOrder
+process order
+Financial Order Checkout Service
+```
+
+Do not send unnecessary LLM query variations for exact symbol searches.
+
+---
+
+# 33. Add Duplicate / Near-Duplicate Suppression
+
+Deduplicate candidates by:
+
+```text
+symbol ID
+document ID
+file + startLine + endLine
+content hash
+```
+
+Do not allow the same method to consume multiple context slots simply because it appears through:
+
+```text
+vector
+BM25
+graph
+parent expansion
+neighbor expansion
+```
+
+Maintain provenance:
+
+```text
+retrievedBy = [VECTOR, GRAPH, BM25]
+```
+
+instead of duplicating the document.
+
+---
+
+# 34. Add Retrieval Provenance
+
+Every final context item should answer:
+
+```text
+Why was this retrieved?
+```
+
+Example:
+
+```text
+processOrder()
+retrievedBy:
+    VECTOR
+    GRAPH_CALLER
+    EXACT_SYMBOL
+
+graphRelation:
+    CALLS
+
+distance:
+    1
+
+rerankScore:
+    0.91
+
+confidence:
+    0.96
+```
+
+This will also help debugging the RAG pipeline.
+
+---
+
+# 35. Add Retrieval Debug Mode
+
+Add a debug mode that exposes the complete retrieval pipeline.
+
+Example output:
+
+```text
+QUERY:
+How does processOrder validate customer?
+
+INTENT:
+BUSINESS_LOGIC
+
+ENTITIES:
+processOrder
+
+VECTOR:
+20 candidates
+
+BM25:
+10 candidates
+
+NEO4J:
+8 candidates
+
+FUSED:
+24 candidates
+
+GRAPH EXPANSION:
++12 candidates
+
+RERANK:
+20 candidates
+
+FINAL:
+7 evidence nodes
+```
+
+For each final result:
+
+```text
+symbol
+score
+source
+reason
+relationship
+file
+lines
+```
+
+This is extremely important for tuning.
+
+---
+
+# 36. Build a Retrieval Evaluation Dataset
+
+Create a benchmark of real developer questions.
+
+Start with:
+
+```text
+100-300 queries
+```
+
+Categorize:
+
+```text
+EXACT_SYMBOL
+FILE_LOOKUP
+CONCEPTUAL
+DEPENDENCY
+CALL_GRAPH
+IMPACT_ANALYSIS
+BUSINESS_LOGIC
+DEBUGGING
+ARCHITECTURE
+FLOW_TRACE
+CROSS_REPO
+TEST_IMPACT
+```
+
+Each query should contain expected evidence.
+
+Example:
+
+```json
+{
+  "query": "What calls processOrder?",
+  "expectedSymbols": [
+    "CheckoutController.checkout",
+    "OrderProcessor.process"
+  ]
+}
+```
+
+---
+
+# 37. Measure Retrieval Metrics
+
+Measure at minimum:
+
+```text
+Recall@1
+Recall@5
+Recall@10
+
+MRR
+NDCG
+Precision@K
+```
+
+For graph:
+
+```text
+caller recall
+callee recall
+dependency recall
+cross-repository recall
+impact-analysis recall
+```
+
+For final RAG:
+
+```text
+answer correctness
+evidence correctness
+citation/source correctness
+unsupported claim rate
+```
+
+---
+
+# 38. Create A/B Retrieval Tests
+
+Compare:
+
+```text
+Baseline
+```
+
+against:
+
+```text
+Baseline + BM25
+Baseline + Graph Expansion
+Baseline + Parent Expansion
+Baseline + Reranking
+Baseline + Hybrid Fusion
+Baseline + Query Decomposition
+```
+
+Do not assume an architectural improvement is beneficial.
+
+Use the benchmark to prove it.
+
+---
+
+# 39. Add Retrieval Observability
+
+Record metrics for every request:
+
+```text
+query
+intent
+
+vector latency
+lexical latency
+neo4j latency
+reranker latency
+
+candidate counts
+final context count
+
+tokens before compression
+tokens after compression
+
+cache hit/miss
+
+confidence
+```
+
+Do not log sensitive source code unnecessarily.
+
+---
+
+# 40. Add Token Budget Management
+
+Context construction should respect a hard token budget.
+
+For example:
+
+```text
+query
++
+primary symbol
++
+graph evidence
++
+source snippets
++
+supporting context
+```
+
+must fit within the configured LLM context window.
+
+Prioritize:
+
+```text
+1. exact target symbol
+2. direct callers/callees
+3. high-confidence graph evidence
+4. high rerank score
+5. parent context
+6. secondary semantic evidence
+```
+
+Never simply concatenate all retrieved chunks.
+
+---
+
+# 41. Add Intent-Specific Context Policies
+
+Example:
+
+```text
+EXACT_SYMBOL
+    target source only
+
+CALL_GRAPH
+    target + callers/callees
+
+DEPENDENCY
+    target + dependency graph
+
+IMPACT_ANALYSIS
+    target + reverse graph + tests + APIs
+
+BUSINESS_LOGIC
+    entry point + call flow + relevant implementations
+
+ARCHITECTURE
+    repository/module/class summaries
+
+DEBUGGING
+    target + callers + callees + exception-related code
+
+FLOW_TRACE
+    complete graph path
+```
+
+This should be implemented through a configurable policy rather than scattered `if/else` statements.
+
+---
+
+# 42. Improve Exact Symbol Resolution
+
+Before performing vector search:
+
+```text
+query
+ ↓
+exact symbol lookup
+```
+
+Search:
+
+```text
+fully qualified name
+class
+method
+field
+signature
+file
+```
+
+If confidence is high:
+
+```text
+skip expensive semantic retrieval
+```
+
+This will reduce latency for developer-style queries.
+
+---
+
+# 43. Support Interface-Aware Retrieval
+
+For:
+
+```text
+"What implementation of PaymentService handles FD?"
+```
+
+use:
+
+```text
+PaymentService
+    |
+    +-- IMPLEMENTS
+    |
+    +--> FDPaymentService
+    |
+    +--> CreditCardPaymentService
+```
+
+Combine graph metadata with semantic filtering.
+
+Prefer exact interface relationships over embedding similarity.
+
+---
+
+# 44. Support Spring-Aware Retrieval
+
+Leverage existing Spring annotations.
+
+Support:
+
+```text
+@RestController
+@Controller
+@Service
+@Repository
+@Component
+@Autowired
+@Bean
+@GetMapping
+@PostMapping
+@PutMapping
+@DeleteMapping
+```
+
+Example:
+
+```text
+"What endpoint calls processOrder?"
+```
+
+Traverse:
+
+```text
+@RestController
+    ↓
+@GetMapping
+    ↓
+controller method
+    ↓
+CALLS
+    ↓
+processOrder
+```
+
+---
+
+# 45. Make Repository Scope Explicit
+
+When multiple repositories are ingested, retrieval should distinguish:
+
+```text
+repository
+module
+branch
+version
+```
+
+Never silently mix different versions of source code.
+
+Where possible include:
+
+```text
+commit SHA
+branch
+repository
+```
+
+in graph and vector metadata.
+
+---
+
+# 46. Improve Incremental Ingestion
+
+Preserve deterministic IDs and hash-based change detection.
+
+For unchanged files:
+
+```text
+AST parse
+can be skipped where possible
+embedding
+can be skipped
+summary generation
+can be skipped
+```
+
+For changed files:
+
+```text
+reparse
+update changed symbols
+remove deleted symbols
+update affected relationships
+update vectors
+regenerate affected summaries
+```
+
+Do not rebuild the entire repository unnecessarily.
+
+---
+
+# 47. Handle Deleted Symbols
+
+Incremental ingestion must detect:
+
+```text
+deleted class
+deleted method
+renamed method
+moved file
+```
+
+Remove stale:
+
+```text
+Neo4j nodes
+Neo4j relationships
+Qdrant points
+summaries
+metadata
+```
+
+Do not leave stale graph nodes that can be retrieved by the RAG system.
+
+---
+
+# 48. Make Cross-Repo Reconciliation Incremental
+
+The current system can relink repositories after ingestion.
+
+Improve this so that a changed repository causes only affected relationships to be reevaluated.
+
+For example:
+
+```text
+axis-oms changed
+```
+
+should not necessarily reprocess every relationship in:
+
+```text
+axis-fd
+axis-utilities
+other repositories
+```
+
+Identify impacted symbols first.
+
+---
+
+# 49. Add Graph Consistency Checks
+
+Periodically validate:
+
+```text
+CALLS target exists
+USES target exists
+INJECTS target exists
+IMPLEMENTS target exists
+EXTENDS target exists
+```
+
+Detect:
+
+```text
+orphan nodes
+STUB nodes
+stale relationships
+duplicate relationships
+missing cross-repo links
+```
+
+Expose this through diagnostics.
+
+---
+
+# 50. Add Retrieval Quality / Confidence Guardrails
+
+If retrieval confidence is low:
+
+```text
+do not confidently answer
+```
+
+Instead provide the LLM with:
+
+```text
+confidence = LOW
+```
+
+and require it to state uncertainty.
+
+Example:
+
+```text
+High confidence:
+exact symbol + AST relationship + source
+
+Medium:
+vector + graph
+
+Low:
+semantic-only match
+```
+
+This reduces hallucination.
+
+---
+
+# 51. Preserve Deterministic Retrieval Where Possible
+
+The system should follow this principle:
+
+```text
+Deterministic information
+        ↓
+AST / Neo4j
+
+Semantic information
+        ↓
+Vector / reranker
+
+Synthesis
+        ↓
+LLM
+```
+
+Do not use the LLM to determine relationships that AST/Neo4j can determine exactly.
+
+Examples:
+
+```text
+Who calls method X?
+    -> Neo4j
+
+What class implements interface X?
+    -> Neo4j
+
+Where is method X?
+    -> Neo4j
+
+How does this business flow work?
+    -> Hybrid + LLM
+
+Why might this failure occur?
+    -> Hybrid + LLM
+```
+
+---
+
+# 52. Keep MCP Tools Focused
+
+Preserve existing MCP tools.
+
+The preferred high-level MCP entry point should remain:
+
+```text
+retrieveCodeContext
+```
+
+Internally it should orchestrate:
+
+```text
+Query understanding
+Query planning
+Lexical retrieval
+Vector retrieval
+Graph retrieval
+Expansion
+Reranking
+Evidence graph
+Context building
+```
+
+Low-level tools such as:
+
+```text
+findSymbol
+findDependencies
+findImpact
+findCallersOfMethod
+findCalledByMethod
+getCodeContext
+```
+
+should remain available for deterministic operations.
+
+---
+
+# 53. Do Not Over-Use Agentic Loops
+
+Do not implement:
+
+```text
+LLM
+ ↓
+search
+ ↓
+LLM
+ ↓
+search
+ ↓
+LLM
+ ↓
+search
+```
+
+for every query.
+
+Prefer deterministic retrieval first.
+
+Only use iterative retrieval when:
+
+```text
+confidence is low
+query is complex
+required evidence is missing
+```
+
+This keeps latency and cost predictable.
+
+---
+
+# 54. Add Optional Iterative Retrieval
+
+For complex queries:
+
+```text
+Initial retrieval
+    ↓
+Evidence completeness check
+    ↓
+Missing evidence?
+    |
+   yes
+    ↓
+Targeted second retrieval
+    ↓
+Final evidence graph
+```
+
+Example:
+
+```text
+Question:
+"Why does checkout fail for credit-card customers?"
+```
+
+Initial retrieval might find:
+
+```text
+checkout
+```
+
+but not:
+
+```text
+credit-card condition
+```
+
+Second retrieval specifically searches for:
+
+```text
+creditcard
+utm_source
+customer type
+validation
+```
+
+---
+
+# 55. Add Configuration Instead of Hardcoding
+
+All retrieval behavior should be configurable.
+
+Example:
+
+```properties
+rag.vector.top-k
+rag.lexical.top-k
+rag.reranker.top-k
+
+rag.similarity-threshold
+
+rag.graph.enabled
+rag.graph.max-depth
+rag.graph.max-results
+
+rag.context-expansion.enabled
+rag.context-expansion.neighbor-chunks
+
+rag.ranking.semantic-weight
+rag.ranking.lexical-weight
+rag.ranking.graph-weight
+rag.ranking.rerank-weight
+
+rag.token-budget
+
+rag.cache.enabled
+rag.cache.ttl
+```
+
+Use sensible defaults.
+
+---
+
+# 56. Preserve Existing Resource Constraints
+
+The current system uses local Ollama embeddings and TEI reranking.
+
+Do not increase concurrency blindly.
+
+For embedding:
+
+```text
+respect Ollama capacity
+respect batch size
+respect context size
+```
+
+For reranking:
+
+```text
+limit candidate count
+use conditional reranking
+```
+
+For Neo4j:
+
+```text
+limit traversal depth
+limit result count
+use indexes
+```
+
+For Qdrant:
+
+```text
+use metadata filters
+avoid unnecessary broad searches
+```
+
+---
+
+# 57. Add Neo4j Indexes / Constraints
+
+Inspect the existing Neo4j schema.
+
+Ensure efficient indexes/constraints exist for:
+
+```text
+repository
+class ID
+method ID
+fully qualified class name
+fully qualified method name
+file path
+symbol ID
+```
+
+Do not create duplicate indexes.
+
+Use `EXPLAIN` / `PROFILE` for expensive Cypher queries.
+
+---
+
+# 58. Optimize Qdrant Retrieval
+
+Inspect:
+
+```text
+collection configuration
+distance metric
+payload indexes
+HNSW configuration
+```
+
+Create payload indexes for frequently filtered fields.
+
+Especially:
+
+```text
+repository
+module
+branch
+class_name
+member_name
+member_type
+package
+```
+
+Do not optimize prematurely without measuring.
+
+---
+
+# 59. Add Latency Budgets
+
+Every retrieval stage should have a budget.
+
+Example:
+
+```text
+Query understanding:
+< 100 ms
+
+Neo4j:
+< 200 ms
+
+Qdrant:
+< 200 ms
+
+BM25:
+< 200 ms
+
+Reranker:
+< 500 ms
+
+Context building:
+< 100 ms
+```
+
+These are target budgets, not hardcoded assumptions.
+
+Record actual latency and tune based on production measurements.
+
+---
+
+# 60. Implement in Phases
+
+Do NOT implement all changes in one large refactor.
+
+Use the following order.
+
+## Phase 1 — Retrieval foundation
+
+Implement:
+
+```text
+1. Query entity extraction
+2. Lexical/BM25 retrieval
+3. Hybrid Vector + Lexical + Neo4j retrieval
+4. Candidate fusion
+5. Retrieval provenance
+6. Debug retrieval mode
+```
+
+## Phase 2 — Graph intelligence
+
+Implement:
+
+```text
+7. Graph-guided retrieval
+8. Graph expansion
+9. Parent/neighbor expansion
+10. Evidence graph
+11. Relationship confidence
+12. Flow tracing
+```
+
+## Phase 3 — Ranking
+
+Implement:
+
+```text
+13. Unified ranking
+14. Intent-specific topK
+15. Intent-specific thresholds
+16. Cross-encoder optimization
+17. Confidence scoring
+```
+
+## Phase 4 — Query intelligence
+
+Implement:
+
+```text
+18. Query decomposition
+19. FLOW_TRACE
+20. CHANGE_ANALYSIS
+21. ERROR_TRACE
+22. API_FLOW
+23. CROSS_REPO_FLOW
+```
+
+## Phase 5 — Context optimization
+
+Implement:
+
+```text
+24. Repository summaries
+25. Module summaries
+26. Class summaries
+27. Method summaries
+28. Hierarchical retrieval
+29. Context compression
+30. Token budgeting
+```
+
+## Phase 6 — Evaluation
+
+Implement:
+
+```text
+31. Retrieval benchmark
+32. Recall@K
+33. MRR
+34. NDCG
+35. Graph recall
+36. A/B testing
+37. Answer correctness evaluation
+38. Retrieval observability
+```
+
+## Phase 7 — Performance
+
+Implement:
+
+```text
+39. Multi-level caching
+40. Parallel retrieval
+41. Incremental graph reconciliation
+42. Qdrant optimization
+43. Neo4j query optimization
+44. Latency budgets
+```
+
+---
+
+# Acceptance Criteria
+
+The implementation is successful only if:
+
+### Retrieval
+
+* Exact symbol queries reliably resolve through Neo4j.
+* Identifier-heavy queries benefit from lexical search.
+* Conceptual queries benefit from vector search.
+* Relationship queries benefit from Neo4j.
+* Complex queries combine all retrieval sources.
+* Duplicate candidates are removed.
+* Retrieval provenance is retained.
+
+### Graph
+
+* Cross-repository relationships are preserved.
+* Graph traversal is bounded.
+* Relationship confidence is available.
+* Flow tracing is deterministic where possible.
+* Impact analysis includes cross-repo callers and tests.
+
+### Ranking
+
+* Vector, lexical, graph, and reranker scores can be combined.
+* Ranking weights are configurable.
+* Reranking is applied only to a manageable candidate set.
+
+### Context
+
+* Parent and neighboring context can be expanded.
+* Context is evidence-based.
+* Source lines are retrieved from the actual source.
+* Final context respects a token budget.
+* Duplicate source snippets are removed.
+
+### Performance
+
+* Independent retrieval operations execute in parallel where appropriate.
+* Existing Ollama resource constraints are respected.
+* Neo4j traversals have depth/result limits.
+* Qdrant filters are used efficiently.
+* Expensive operations are cached where appropriate.
+
+### Evaluation
+
+* A benchmark of real developer queries exists.
+* Retrieval metrics are measurable.
+* Baseline vs improved retrieval can be compared.
+* Every optimization can be validated quantitatively.
+
+---
+
+# Important Implementation Rules
+
+1. **First inspect the existing code.**
+2. Do not rewrite working services unnecessarily.
+3. Reuse existing `QueryIntentClassifier`.
+4. Reuse existing `AdaptiveRetrievalRouter`.
+5. Reuse existing Neo4j graph relationships.
+6. Reuse existing Qdrant metadata.
+7. Reuse the existing TEI reranker.
+8. Reuse existing source-line retrieval.
+9. Reuse existing incremental ingestion/hash mechanisms.
+10. Preserve MCP compatibility.
+11. Preserve existing API contracts unless there is a strong reason to change them.
+12. Avoid introducing a new framework when an existing dependency already provides the functionality.
+13. Keep retrieval strategies independently testable.
+14. Keep ranking configurable.
+15. Keep graph traversal bounded.
+16. Keep LLM usage out of deterministic code-analysis operations.
+17. Do not blindly increase `topK`.
+18. Do not blindly lower similarity thresholds.
+19. Do not blindly increase embedding/reranking concurrency.
+20. Measure retrieval quality before and after each major change.
+
+---
+
+# Expected Final Architecture
+
+The target architecture should be:
+
+```text
+                    MCP / User Query
+                           |
+                           v
+                  Query Understanding
+                           |
+            +--------------+--------------+
+            |              |              |
+         Intent         Entities       Constraints
+            |              |              |
+            +--------------+--------------+
+                           |
+                           v
+                     Query Planner
+                           |
+          +----------------+----------------+
+          |                |                |
+          v                v                v
+       Lexical          Qdrant            Neo4j
+        BM25             Vector        Exact/Graph
+          |                |                |
+          +----------------+----------------+
+                           |
+                           v
+                    Candidate Fusion
+                           |
+                           v
+                  Graph-Guided Expansion
+                           |
+             +-------------+-------------+
+             |             |             |
+           Callers       Callees     Dependencies
+             |             |             |
+             +-------------+-------------+
+                           |
+                           v
+                  Parent/Neighbor Expansion
+                           |
+                           v
+                    Cross Encoder
+                      Reranking
+                           |
+                           v
+                    Evidence Graph
+                           |
+                           v
+                  Confidence Filtering
+                           |
+                           v
+                 Exact Source Retrieval
+                           |
+                           v
+                   Context Compression
+                           |
+                           v
+                          LLM
+```
+
+The main design principle should be:
+
+```text
+AST / Neo4j
+    =
+deterministic structural truth
+
+BM25
+    =
+exact identifier/token retrieval
+
+Qdrant
+    =
+semantic retrieval
+
+Cross Encoder
+    =
+fine-grained relevance ranking
+
+Evidence Graph
+    =
+retrieval reasoning/provenance
+
+LLM
+    =
+understanding + synthesis
+```
+
+Do not make the LLM responsible for information that can be determined reliably from the AST or graph.
+
+Implement the improvements in phases, add tests for every new retrieval component, and provide a short implementation summary after each phase describing:
+
+* files changed
+* classes added/modified
+* configuration added
+* tests added
+* performance impact
+* retrieval-quality impact
+* known limitations
